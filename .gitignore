@@ -1,0 +1,15 @@
+.DS_Store
+
+# Build outputs
+/dotfile-manager
+/bin/
+/dist/
+
+# Test outputs
+*.test
+*.out
+coverage.out
+
+# IDE files
+.idea/
+.vscode/
