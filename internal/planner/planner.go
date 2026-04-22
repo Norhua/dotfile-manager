@@ -14,15 +14,19 @@ import (
 	"unicode/utf8"
 
 	"dotfile-manager/internal/config"
+	"dotfile-manager/internal/state"
 
 	"github.com/pmezard/go-difflib/difflib"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	ActionEnsureDir ActionKind = "ensure_dir"
-	ActionSymlink   ActionKind = "symlink"
-	ActionCopyFile  ActionKind = "copy_file"
+	ActionEnsureDir        ActionKind = "ensure_dir"
+	ActionSymlink          ActionKind = "symlink"
+	ActionCopyFile         ActionKind = "copy_file"
+	ActionRemoveFile       ActionKind = "remove_file"
+	ActionRemoveSymlink    ActionKind = "remove_symlink"
+	ActionRemoveDirIfEmpty ActionKind = "remove_dir_if_empty"
 )
 
 const (
@@ -35,6 +39,7 @@ type ActionKind string
 type Action struct {
 	Kind               ActionKind `json:"kind"`
 	Profile            string     `json:"profile"`
+	StateKind          string     `json:"state_kind,omitempty"`
 	SourcePath         string     `json:"source_path,omitempty"`
 	TargetPath         string     `json:"target_path"`
 	AutoParent         bool       `json:"auto_parent"`
@@ -57,13 +62,20 @@ type Action struct {
 	SourceModeOctal    string     `json:"source_mode_octal,omitempty"`
 	DesiredModeOctal   string     `json:"desired_mode_octal,omitempty"`
 	DesiredTargetLabel string     `json:"desired_target_label,omitempty"`
+	ExpectedHash       string     `json:"expected_hash,omitempty"`
+	ExpectedLinkTarget string     `json:"expected_link_target,omitempty"`
+	SourceHash         string     `json:"source_hash,omitempty"`
+	TrackState         bool       `json:"track_state"`
+	CreatedByTool      bool       `json:"created_by_tool"`
 }
 
 type Plan struct {
-	Actions                    []Action `json:"actions"`
-	SkippedNoChange            int      `json:"skipped_no_change"`
-	BuiltWithPrivilege         bool     `json:"built_with_privilege"`
-	RequiresExecutionPrivilege bool     `json:"requires_execution_privilege"`
+	Actions                    []Action            `json:"actions"`
+	ObservedItems              []state.ManagedItem `json:"observed_items,omitempty"`
+	Warnings                   []string            `json:"warnings,omitempty"`
+	SkippedNoChange            int                 `json:"skipped_no_change"`
+	BuiltWithPrivilege         bool                `json:"built_with_privilege"`
+	RequiresExecutionPrivilege bool                `json:"requires_execution_privilege"`
 }
 
 type PrivilegeRequiredError struct {
@@ -102,14 +114,17 @@ type claim struct {
 }
 
 type builder struct {
-	plan         Plan
-	ensureDirs   map[string]int
-	currentUID   int
-	currentGID   int
-	isPrivileged bool
+	plan           Plan
+	ensureDirs     map[string]int
+	currentUID     int
+	currentGID     int
+	isPrivileged   bool
+	previousItems  map[string]state.ManagedItem
+	currentEntries map[string]entry
+	cleanupExact   map[string]struct{}
 }
 
-func Build(resolved config.Resolved) (Plan, error) {
+func Build(resolved config.Resolved, previous *state.File) (Plan, error) {
 	entries := make([]entry, 0)
 	for _, profile := range resolved.Profiles {
 		expanded, err := expandProfile(profile)
@@ -123,17 +138,36 @@ func Build(resolved config.Resolved) (Plan, error) {
 		return Plan{}, err
 	}
 
+	currentEntries := make(map[string]entry, len(entries))
+	for _, item := range entries {
+		currentEntries[item.TargetPath] = item
+	}
+
+	previousItems := map[string]state.ManagedItem{}
+	if previous != nil {
+		previousItems = previous.ItemMap()
+	}
+
 	sortEntries(entries)
 
 	b := builder{
 		plan: Plan{
 			Actions:            make([]Action, 0, len(entries)),
+			ObservedItems:      []state.ManagedItem{},
+			Warnings:           []string{},
 			BuiltWithPrivilege: os.Geteuid() == 0,
 		},
-		ensureDirs:   map[string]int{},
-		currentUID:   os.Geteuid(),
-		currentGID:   os.Getegid(),
-		isPrivileged: os.Geteuid() == 0,
+		ensureDirs:     map[string]int{},
+		currentUID:     os.Geteuid(),
+		currentGID:     os.Getegid(),
+		isPrivileged:   os.Geteuid() == 0,
+		previousItems:  previousItems,
+		currentEntries: currentEntries,
+		cleanupExact:   map[string]struct{}{},
+	}
+
+	if err := b.planCleanup(); err != nil {
+		return Plan{}, err
 	}
 
 	for _, item := range entries {
@@ -297,6 +331,21 @@ func (b *builder) ensureParentDirs(targetDir string, profileName string, allowRe
 }
 
 func (b *builder) planSymlink(item entry) error {
+	if _, ok := b.cleanupExact[item.TargetPath]; ok {
+		b.addAction(Action{
+			Kind:              ActionSymlink,
+			Profile:           item.Profile.Name,
+			SourcePath:        item.SourcePath,
+			TargetPath:        item.TargetPath,
+			RequiresPrivilege: b.needsPrivilege(item.TargetPath, false, 0, 0),
+			TrackState:        true,
+			CreatedByTool:     true,
+			StateKind:         string(state.ItemSymlink),
+		})
+		return nil
+	}
+
+	previous, hasPrevious := b.previousItems[item.TargetPath]
 	info, err := lstat(item.TargetPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -306,6 +355,9 @@ func (b *builder) planSymlink(item entry) error {
 				SourcePath:        item.SourcePath,
 				TargetPath:        item.TargetPath,
 				RequiresPrivilege: b.needsPrivilege(item.TargetPath, false, 0, 0),
+				TrackState:        true,
+				CreatedByTool:     true,
+				StateKind:         string(state.ItemSymlink),
 			})
 			return nil
 		}
@@ -313,15 +365,41 @@ func (b *builder) planSymlink(item entry) error {
 	}
 
 	if info.Mode()&os.ModeSymlink != 0 {
-		linkTarget, err := os.Readlink(item.TargetPath)
+		matchesDesired, err := symlinkMatches(item.TargetPath, item.SourcePath)
 		if err != nil {
 			if isPermission(err) {
 				return &PrivilegeRequiredError{Path: item.TargetPath, Op: "read symlink", Err: err}
 			}
 			return err
 		}
-		if linkTarget == item.SourcePath {
+		if matchesDesired {
+			if err := b.observeManagedSymlink(item, info, !hasPrevious); err != nil {
+				return err
+			}
 			b.plan.SkippedNoChange++
+			return nil
+		}
+		if hasPrevious && previous.Kind == state.ItemSymlink {
+			matchesPrevious, err := symlinkMatches(item.TargetPath, previous.LinkTarget)
+			if err != nil {
+				return err
+			}
+			if !matchesPrevious {
+				return fmt.Errorf("managed symlink %q was modified after the last successful apply", item.TargetPath)
+			}
+			b.addAction(Action{
+				Kind:               ActionSymlink,
+				Profile:            item.Profile.Name,
+				SourcePath:         item.SourcePath,
+				TargetPath:         item.TargetPath,
+				ExistingTarget:     true,
+				Replace:            true,
+				RequiresPrivilege:  b.needsPrivilege(item.TargetPath, false, 0, 0),
+				TrackState:         true,
+				CreatedByTool:      true,
+				StateKind:          string(state.ItemSymlink),
+				ExpectedLinkTarget: previous.LinkTarget,
+			})
 			return nil
 		}
 	}
@@ -339,6 +417,9 @@ func (b *builder) planSymlink(item entry) error {
 		Replace:           true,
 		ReplaceRecursive:  info.IsDir(),
 		RequiresPrivilege: b.needsPrivilege(item.TargetPath, false, 0, 0),
+		TrackState:        true,
+		CreatedByTool:     true,
+		StateKind:         string(state.ItemSymlink),
 	})
 	return nil
 }
@@ -352,6 +433,7 @@ func (b *builder) planRecursiveFile(item entry) error {
 }
 
 func (b *builder) planCopyDir(item entry) error {
+	previous, hasPrevious := b.previousItems[item.TargetPath]
 	desiredUID, desiredGID, ownerLabel, err := desiredOwnership(item.SourceInfo, item.Profile.Permissions)
 	if err != nil {
 		return fmt.Errorf("profile %q owner: %w", item.Profile.Name, err)
@@ -364,6 +446,9 @@ func (b *builder) planCopyDir(item entry) error {
 		}
 		desiredMode = mode
 	}
+	if _, ok := b.cleanupExact[item.TargetPath]; ok {
+		return b.ensureDir(item.TargetPath, item.Profile.Name, false, false, true, true, desiredMode, true, desiredUID, desiredGID, ownerLabel)
+	}
 
 	targetInfo, err := lstat(item.TargetPath)
 	if err != nil {
@@ -374,6 +459,9 @@ func (b *builder) planCopyDir(item entry) error {
 	}
 	if !targetInfo.IsDir() {
 		return fmt.Errorf("copy target %q conflicts with an existing non-directory", item.TargetPath)
+	}
+	if !hasPrevious || previous.Kind != state.ItemDir {
+		return fmt.Errorf("copy target directory %q already exists and is not a previously managed copy directory; please inspect and remove it manually", item.TargetPath)
 	}
 
 	currentUID, currentGID, err := statOwnership(targetInfo)
@@ -391,6 +479,26 @@ func (b *builder) planCopyDir(item entry) error {
 }
 
 func (b *builder) planCopyFile(item entry) error {
+	if _, ok := b.cleanupExact[item.TargetPath]; ok {
+		sourceBytes, err := os.ReadFile(item.SourcePath)
+		if err != nil {
+			return err
+		}
+		desiredUID, desiredGID, ownerLabel, err := desiredOwnership(item.SourceInfo, item.Profile.Permissions)
+		if err != nil {
+			return fmt.Errorf("profile %q owner: %w", item.Profile.Name, err)
+		}
+		desiredMode := item.SourceInfo.Mode().Perm()
+		if item.Profile.Permissions.FileMode != "" {
+			mode, err := parseMode(item.Profile.Permissions.FileMode)
+			if err != nil {
+				return err
+			}
+			desiredMode = mode
+		}
+		return b.addCopyAction(item, false, false, sourceBytes, nil, desiredUID, desiredGID, ownerLabel, desiredMode, "")
+	}
+	previous, hasPrevious := b.previousItems[item.TargetPath]
 	desiredUID, desiredGID, ownerLabel, err := desiredOwnership(item.SourceInfo, item.Profile.Permissions)
 	if err != nil {
 		return fmt.Errorf("profile %q owner: %w", item.Profile.Name, err)
@@ -412,31 +520,15 @@ func (b *builder) planCopyFile(item entry) error {
 	targetInfo, err := lstat(item.TargetPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			b.addAction(Action{
-				Kind:               ActionCopyFile,
-				Profile:            item.Profile.Name,
-				SourcePath:         item.SourcePath,
-				TargetPath:         item.TargetPath,
-				ContentChanged:     true,
-				RequiresPrivilege:  b.needsPrivilege(item.TargetPath, true, desiredUID, desiredGID),
-				ManageOwner:        true,
-				DesiredUID:         desiredUID,
-				DesiredGID:         desiredGID,
-				OwnerLabel:         ownerLabel,
-				ManageMode:         true,
-				DesiredMode:        uint32(desiredMode.Perm()),
-				DesiredModeOctal:   fmt.Sprintf("%04o", desiredMode.Perm()),
-				ManagedPathIsDir:   false,
-				SourceOwnerLabel:   ownerLabel,
-				SourceModeOctal:    fmt.Sprintf("%04o", item.SourceInfo.Mode().Perm()),
-				DesiredTargetLabel: item.TargetPath,
-			})
-			return nil
+			return b.addCopyAction(item, false, false, sourceBytes, nil, desiredUID, desiredGID, ownerLabel, desiredMode, "")
 		}
 		return err
 	}
 	if !targetInfo.Mode().IsRegular() {
 		return fmt.Errorf("copy target %q conflicts with an existing non-file", item.TargetPath)
+	}
+	if !hasPrevious || previous.Kind != state.ItemFile {
+		return fmt.Errorf("copy target %q already exists and is not a previously managed copy file", item.TargetPath)
 	}
 
 	targetBytes, err := os.ReadFile(item.TargetPath)
@@ -451,6 +543,10 @@ func (b *builder) planCopyFile(item entry) error {
 	if err != nil {
 		return err
 	}
+	targetHash := hashBytes(targetBytes)
+	if targetHash != previous.ContentHash || currentUID != previous.UID || currentGID != previous.GID || uint32(targetInfo.Mode().Perm()) != previous.Mode.MustUint32() {
+		return fmt.Errorf("managed copy file %q was modified after the last successful apply", item.TargetPath)
+	}
 	contentEqual := bytes.Equal(sourceBytes, targetBytes)
 	ownerEqual := currentUID == desiredUID && currentGID == desiredGID
 	modeEqual := targetInfo.Mode().Perm() == desiredMode
@@ -459,15 +555,23 @@ func (b *builder) planCopyFile(item entry) error {
 		return nil
 	}
 
-	diffText, diffSummary := buildDiffPreview(item.TargetPath, sourceBytes, targetBytes)
+	return b.addCopyAction(item, true, contentEqual, sourceBytes, targetBytes, desiredUID, desiredGID, ownerLabel, desiredMode, previous.ContentHash)
+}
+
+func (b *builder) addCopyAction(item entry, existingTarget bool, metadataOnly bool, sourceBytes []byte, targetBytes []byte, desiredUID int, desiredGID int, ownerLabel string, desiredMode os.FileMode, expectedHash string) error {
+	diffText := ""
+	diffSummary := ""
+	if existingTarget && !metadataOnly {
+		diffText, diffSummary = buildDiffPreview(item.TargetPath, sourceBytes, targetBytes)
+	}
 	b.addAction(Action{
 		Kind:               ActionCopyFile,
 		Profile:            item.Profile.Name,
 		SourcePath:         item.SourcePath,
 		TargetPath:         item.TargetPath,
-		ExistingTarget:     true,
-		ContentChanged:     !contentEqual,
-		MetadataOnly:       contentEqual,
+		ExistingTarget:     existingTarget,
+		ContentChanged:     !metadataOnly,
+		MetadataOnly:       metadataOnly,
 		RequiresPrivilege:  b.needsPrivilege(item.TargetPath, true, desiredUID, desiredGID),
 		ManageOwner:        true,
 		DesiredUID:         desiredUID,
@@ -482,6 +586,30 @@ func (b *builder) planCopyFile(item entry) error {
 		SourceOwnerLabel:   ownerLabel,
 		SourceModeOctal:    fmt.Sprintf("%04o", item.SourceInfo.Mode().Perm()),
 		DesiredTargetLabel: item.TargetPath,
+		TrackState:         true,
+		CreatedByTool:      true,
+		StateKind:          string(state.ItemFile),
+		ExpectedHash:       expectedHash,
+		SourceHash:         hashBytes(sourceBytes),
+	})
+	return nil
+}
+
+func (b *builder) observeManagedSymlink(item entry, info os.FileInfo, adopted bool) error {
+	uid, gid, err := statOwnership(info)
+	if err != nil {
+		return err
+	}
+	b.plan.ObservedItems = append(b.plan.ObservedItems, state.ManagedItem{
+		Path:          item.TargetPath,
+		Profile:       item.Profile.Name,
+		Kind:          state.ItemSymlink,
+		Strategy:      string(item.Profile.Strategy),
+		LinkTarget:    item.SourcePath,
+		UID:           uid,
+		GID:           gid,
+		Mode:          state.ModeFromUint32(uint32(info.Mode().Perm())),
+		CreatedByTool: !adopted,
 	})
 	return nil
 }
@@ -503,6 +631,8 @@ func (b *builder) ensureDir(targetPath string, profileName string, allowReplace 
 			action.DesiredModeOctal = fmt.Sprintf("%04o", desiredMode.Perm())
 		}
 		action.RequiresPrivilege = action.RequiresPrivilege || b.needsPrivilege(targetPath, ownerManaged, desiredUID, desiredGID)
+		action.TrackState = true
+		action.StateKind = string(state.ItemDir)
 		b.plan.Actions[idx] = action
 		return nil
 	}
@@ -524,6 +654,9 @@ func (b *builder) ensureDir(targetPath string, profileName string, allowReplace 
 				DesiredMode:       uint32(desiredMode.Perm()),
 				DesiredModeOctal:  fmt.Sprintf("%04o", desiredMode.Perm()),
 				ManagedPathIsDir:  true,
+				TrackState:        true,
+				StateKind:         string(state.ItemDir),
+				CreatedByTool:     true,
 			}
 			b.addEnsureDir(action)
 			return nil
@@ -552,13 +685,18 @@ func (b *builder) ensureDir(targetPath string, profileName string, allowReplace 
 			DesiredMode:       uint32(desiredMode.Perm()),
 			DesiredModeOctal:  fmt.Sprintf("%04o", desiredMode.Perm()),
 			ManagedPathIsDir:  true,
+			TrackState:        true,
+			StateKind:         string(state.ItemDir),
+			CreatedByTool:     true,
 		}
 		b.addEnsureDir(action)
 		return nil
 	}
 
 	if !manageMode && !ownerManaged {
-		b.plan.SkippedNoChange++
+		if !autoParent {
+			b.plan.SkippedNoChange++
+		}
 		return nil
 	}
 	currentUID, currentGID, err := statOwnership(info)
@@ -588,6 +726,9 @@ func (b *builder) ensureDir(targetPath string, profileName string, allowReplace 
 		DesiredMode:       uint32(desiredMode.Perm()),
 		DesiredModeOctal:  fmt.Sprintf("%04o", desiredMode.Perm()),
 		ManagedPathIsDir:  true,
+		TrackState:        true,
+		StateKind:         string(state.ItemDir),
+		CreatedByTool:     false,
 	}
 	b.addEnsureDir(action)
 	return nil
@@ -662,12 +803,14 @@ func buildDiffPreview(targetPath string, sourceBytes []byte, targetBytes []byte)
 }
 
 func Format(plan Plan) string {
-	if len(plan.Actions) == 0 {
+	if len(plan.Actions) == 0 && len(plan.Warnings) == 0 {
 		return "No changes required.\n"
 	}
 
 	var lines []string
-	lines = append(lines, "Planned changes:")
+	if len(plan.Actions) > 0 {
+		lines = append(lines, "Planned changes:")
+	}
 	for _, action := range plan.Actions {
 		lines = append(lines, "  - "+describeAction(action))
 		if action.Diff != "" {
@@ -676,6 +819,12 @@ func Format(plan Plan) string {
 			}
 		} else if action.DiffSummary != "" {
 			lines = append(lines, "      "+action.DiffSummary)
+		}
+	}
+	if len(plan.Warnings) > 0 {
+		lines = append(lines, "Warnings:")
+		for _, warning := range plan.Warnings {
+			lines = append(lines, "  - "+warning)
 		}
 	}
 	lines = append(lines, fmt.Sprintf("Summary: %d change(s), %d skipped as unchanged", len(plan.Actions), plan.SkippedNoChange))
@@ -725,6 +874,12 @@ func describeAction(action Action) string {
 			return fmt.Sprintf("overwrite file %s <- %s", action.TargetPath, action.SourcePath)
 		}
 		return fmt.Sprintf("copy file %s <- %s", action.TargetPath, action.SourcePath)
+	case ActionRemoveFile:
+		return fmt.Sprintf("remove managed file %s", action.TargetPath)
+	case ActionRemoveSymlink:
+		return fmt.Sprintf("remove managed symlink %s", action.TargetPath)
+	case ActionRemoveDirIfEmpty:
+		return fmt.Sprintf("remove managed directory if empty %s", action.TargetPath)
 	default:
 		return fmt.Sprintf("%s %s", action.Kind, action.TargetPath)
 	}

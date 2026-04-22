@@ -12,8 +12,10 @@ import (
 
 	"dotfile-manager/internal/config"
 	"dotfile-manager/internal/executor"
+	"dotfile-manager/internal/manifest"
 	"dotfile-manager/internal/planner"
 	"dotfile-manager/internal/privilege"
+	"dotfile-manager/internal/state"
 )
 
 type options struct {
@@ -71,19 +73,25 @@ func runNormal(opts options, stdin io.Reader, stdout io.Writer, stderr io.Writer
 	if err != nil {
 		return err
 	}
+	env := currentEnv()
 
 	resolved, err := config.Load(config.LoadOptions{
 		ConfigPath: opts.ConfigPath,
 		Host:       opts.Host,
 		Hostname:   hostname,
 		HomeDir:    homeDir,
-		Env:        currentEnv(),
+		Env:        env,
 	})
 	if err != nil {
 		return err
 	}
+	statePath := state.Path(resolved.ConfigPath, resolved.Host, homeDir, env)
+	previousState, err := loadStateIfExists(statePath)
+	if err != nil {
+		return err
+	}
 
-	plan, err := planner.Build(resolved)
+	plan, err := planner.Build(resolved, previousState)
 	if err != nil {
 		var privilegeErr *planner.PrivilegeRequiredError
 		if errors.As(err, &privilegeErr) && !privilege.IsRoot() {
@@ -96,7 +104,7 @@ func runNormal(opts options, stdin io.Reader, stdout io.Writer, stderr io.Writer
 					return errors.New("aborted while requesting administrator privileges for scan")
 				}
 			}
-			plan, err = privilege.RunPlanHelper(resolved, stdout, stderr)
+			plan, err = privilege.RunPlanHelper(privilege.PlanRequest{Resolved: resolved, Previous: previousState}, stdout, stderr)
 			if err != nil {
 				return err
 			}
@@ -108,8 +116,12 @@ func runNormal(opts options, stdin io.Reader, stdout io.Writer, stderr io.Writer
 	if _, err := io.WriteString(stdout, planner.Format(plan)); err != nil {
 		return err
 	}
+	newState, err := manifest.Build(resolved, plan, previousState)
+	if err != nil {
+		return err
+	}
 	if len(plan.Actions) == 0 {
-		return nil
+		return saveStateIfChanged(statePath, previousState, newState)
 	}
 
 	if !opts.Yes {
@@ -123,20 +135,26 @@ func runNormal(opts options, stdin io.Reader, stdout io.Writer, stderr io.Writer
 	}
 
 	if plan.RequiresExecutionPrivilege && !privilege.IsRoot() {
-		return privilege.RunApplyHelper(plan, stdout, stderr)
+		if err := privilege.RunApplyHelper(plan, stdout, stderr); err != nil {
+			return err
+		}
+	} else {
+		if err := executor.Apply(plan, stdout); err != nil {
+			return err
+		}
 	}
-	return executor.Apply(plan, stdout)
+	return saveStateIfChanged(statePath, previousState, newState)
 }
 
 func runInternalPlan(inputPath string, outputPath string) error {
 	if inputPath == "" || outputPath == "" {
 		return errors.New("internal plan mode requires input and output paths")
 	}
-	var resolved config.Resolved
-	if err := readJSON(inputPath, &resolved); err != nil {
+	var request privilege.PlanRequest
+	if err := readJSON(inputPath, &request); err != nil {
 		return err
 	}
-	plan, err := planner.Build(resolved)
+	plan, err := planner.Build(request.Resolved, request.Previous)
 	if err != nil {
 		return err
 	}
@@ -199,4 +217,34 @@ func writeJSON(path string, value any) error {
 		return err
 	}
 	return os.WriteFile(path, content, 0o600)
+}
+
+func loadStateIfExists(path string) (*state.File, error) {
+	loaded, err := state.Load(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &loaded, nil
+}
+
+func saveStateIfChanged(path string, previous *state.File, next state.File) error {
+	if previous != nil {
+		prevContent, err := json.Marshal(previous)
+		if err != nil {
+			return err
+		}
+		nextContent, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		if string(prevContent) == string(nextContent) {
+			return nil
+		}
+	} else if len(next.Items) == 0 {
+		return nil
+	}
+	return state.Save(path, next)
 }

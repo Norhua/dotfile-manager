@@ -27,7 +27,7 @@ func Locate(explicit string, homeDir string) (string, error) {
 
 	paths := []string{
 		filepath.Join(homeDir, ".config", "dotfile-manager", DefaultConfigName),
-		filepath.Join(homeDir, "profile", DefaultConfigName),
+		filepath.Join(homeDir, "dotfile", DefaultConfigName),
 	}
 
 	for _, candidate := range paths {

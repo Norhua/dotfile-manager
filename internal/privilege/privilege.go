@@ -10,6 +10,7 @@ import (
 
 	"dotfile-manager/internal/config"
 	"dotfile-manager/internal/planner"
+	"dotfile-manager/internal/state"
 )
 
 const (
@@ -17,12 +18,17 @@ const (
 	ModeApply = "apply"
 )
 
+type PlanRequest struct {
+	Resolved config.Resolved `json:"resolved"`
+	Previous *state.File     `json:"previous,omitempty"`
+}
+
 func IsRoot() bool {
 	return os.Geteuid() == 0
 }
 
-func RunPlanHelper(resolved config.Resolved, stdout io.Writer, stderr io.Writer) (planner.Plan, error) {
-	inputPath, cleanupInput, err := writeTempJSON("resolved-*.json", resolved)
+func RunPlanHelper(request PlanRequest, stdout io.Writer, stderr io.Writer) (planner.Plan, error) {
+	inputPath, cleanupInput, err := writeTempJSON("resolved-*.json", request)
 	if err != nil {
 		return planner.Plan{}, err
 	}
