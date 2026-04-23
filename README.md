@@ -1,6 +1,6 @@
 # dotfile-manager
 
-`dotfile-manager` 是一个用 Go 实现的 dotfiles 部署工具，用来把仓库中的配置按声明式规则映射到目标系统中。
+`dotfile-manager` 是一个用 Go 实现的 dotfiles 部署工具，用来把你的配置文件按声明式规则映射到各个位置，例如 `~/.config` `/etc` 等。
 
 当前支持三种策略：
 
